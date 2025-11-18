@@ -1,0 +1,119 @@
+# ==========================================
+# CREDENTIALS ET SECRETS
+# ==========================================
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+*.pem
+*.key
+*.p12
+credentials.json
+secrets.json
+service-account.json
+
+# ==========================================
+# CONFIGURATION MCP AVEC CREDENTIALS
+# ==========================================
+.claude/mcp.json
+mcp.json
+**/mcp.json
+
+# ==========================================
+# FICHIERS SYSTÈME
+# ==========================================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ==========================================
+# NODE / JAVASCRIPT
+# ==========================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+
+# ==========================================
+# PYTHON
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# ==========================================
+# IDE
+# ==========================================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.cursor/
+
+# ==========================================
+# BUILD ET CACHE
+# ==========================================
+.next/
+out/
+.cache/
+.vercel
+.turbo
+
+# ==========================================
+# LOGS
+# ==========================================
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ==========================================
+# TESTS
+# ==========================================
+coverage/
+.nyc_output/
+*.lcov
+
+# ==========================================
+# DATABASES
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ==========================================
+# SAUVEGARDES
+# ==========================================
+*.backup
+*.bak
+*.old
+
+# ==========================================
+# CLAUDE CODE
+# ==========================================
+.claude/
+.bash_history
+
+# ==========================================
+# HETZNER CONFIG LOCALE
+# ==========================================
+.config/hcloud/
+
