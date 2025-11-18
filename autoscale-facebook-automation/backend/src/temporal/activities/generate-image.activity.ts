@@ -9,6 +9,7 @@ import OpenAI from 'openai';
 import { Context } from '@temporalio/activity';
 import { supabase } from '../../services/supabase.service.js';
 import axios from 'axios';
+import { captureError, addBreadcrumb } from '../../config/sentry.js';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -52,6 +53,10 @@ export async function generateImage(
       style: 'natural', // Pas vivid (trop saturé pour B2B)
     });
 
+    if (!response.data || response.data.length === 0) {
+      throw new Error('DALL-E 3 returned no data');
+    }
+
     const generatedUrl = response.data[0]?.url;
     if (!generatedUrl) {
       throw new Error('DALL-E 3 returned no image URL');
@@ -69,35 +74,45 @@ export async function generateImage(
 
     const fileName = `facebook/${Date.now()}_${input.contentType}.png`;
 
-    const { data: uploadData, error: uploadError } = await supabase.storage
-      .from('generated-images')
-      .upload(fileName, imageBuffer, {
-        contentType: 'image/png',
-        cacheControl: '31536000', // 1 an de cache
-        upsert: false,
-      });
+    // Upload vers Supabase Storage
+    const uploadResult = await supabase.uploadImageToStorage(
+      imageBuffer,
+      fileName,
+      'image/png'
+    );
 
-    if (uploadError) {
-      throw new Error(`Supabase upload failed: ${uploadError.message}`);
+    // Validate upload succeeded and returned valid data
+    if (!uploadResult.path || !uploadResult.publicUrl) {
+      throw new Error('Supabase storage upload returned invalid result (missing path or publicUrl)');
     }
 
-    // Récupérer URL publique
-    const { data: publicUrlData } = supabase.storage
-      .from('generated-images')
-      .getPublicUrl(fileName);
+    const { path: supabasePath, publicUrl } = uploadResult;
 
-    const publicUrl = publicUrlData.publicUrl;
+    // Additional validation: ensure URL is properly formed
+    if (!publicUrl.startsWith('http')) {
+      throw new Error(`Invalid public URL returned from storage: ${publicUrl}`);
+    }
 
     console.log(`[Activity:GenerateImage] Success! URL: ${publicUrl}`);
 
     return {
       success: true,
       imageUrl: publicUrl,
-      supabasePath: fileName,
+      supabasePath,
     };
 
   } catch (error) {
     console.error('[Activity:GenerateImage] Error:', error);
+
+    // Send to Sentry with context
+    if (error instanceof Error) {
+      captureError(error, {
+        activity: 'generateImage',
+        contentType: input.contentType,
+        style: input.style,
+        hasImageUrl: !!input.contentText,
+      });
+    }
 
     return {
       success: false,
@@ -206,13 +221,36 @@ function extractKeyPhrase(text: string): string {
 }
 
 /**
- * Télécharge image depuis URL DALL-E
+ * Télécharge image depuis URL DALL-E avec validation
  */
 async function downloadImage(url: string): Promise<Buffer> {
   const response = await axios.get(url, {
     responseType: 'arraybuffer',
     timeout: 30000, // 30s timeout
+    validateStatus: (status) => status === 200, // Only 200 is success
   });
 
-  return Buffer.from(response.data);
+  // Validate response has data
+  if (!response.data || response.data.byteLength === 0) {
+    throw new Error('Downloaded image is empty');
+  }
+
+  const buffer = Buffer.from(response.data);
+
+  // Validate minimum size
+  if (buffer.length < 100) {
+    throw new Error(`Downloaded file too small to be valid image (${buffer.length} bytes)`);
+  }
+
+  // Check PNG magic bytes (89 50 4E 47) or JPEG magic bytes (FF D8 FF)
+  const isPNG = buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47;
+  const isJPEG = buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF;
+
+  if (!isPNG && !isJPEG) {
+    throw new Error('Downloaded file is not a valid PNG or JPEG image (invalid magic bytes)');
+  }
+
+  console.log(`[DownloadImage] Successfully downloaded ${isPNG ? 'PNG' : 'JPEG'} image (${(buffer.length / 1024).toFixed(1)} KB)`);
+
+  return buffer;
 }

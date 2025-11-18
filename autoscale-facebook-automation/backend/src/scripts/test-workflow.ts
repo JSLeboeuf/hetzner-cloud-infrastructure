@@ -95,8 +95,10 @@ async function main() {
         const description = await handle.describe();
 
         // Vérifier si workflow est en attente d'approbation
-        // (il y aura des pending activities pour le signal)
-        if (description.pendingActivities.length === 0) {
+        // (check status)
+        if (description.status.name === 'RUNNING') {
+          // Continue waiting
+        } else {
           console.log('✅ Génération terminée!\n');
           break;
         }

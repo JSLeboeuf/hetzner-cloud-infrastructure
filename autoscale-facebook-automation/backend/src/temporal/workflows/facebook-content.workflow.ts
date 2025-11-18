@@ -57,8 +57,15 @@ export interface ApprovalDecision {
 export interface WorkflowResult {
   success: boolean;
   postId?: string;
+  facebookPostId?: string;
   variation: number;
   publishedAt?: Date;
+  imageUrl?: string;
+  variations?: Array<{
+    text: string;
+    style: string;
+    score: number;
+  }>;
   metrics?: {
     generationTime: number;
     approvalTime: number;
@@ -78,10 +85,40 @@ export async function facebookContentWorkflow(
   let approvalDecision: ApprovalDecision | null = null;
   let workflowCancelled = false;
 
-  // Setup signal handlers
+  // Setup signal handlers with race condition protection
   setHandler(approvalSignal, (decision: ApprovalDecision) => {
+    // Prevent duplicate approvals (race condition protection)
+    if (approvalReceived) {
+      console.warn('[Workflow] Approval already received, ignoring duplicate signal');
+      return;
+    }
+
+    // Validate signal structure (defensive programming - runtime type safety)
+    if (typeof decision !== 'object' || decision === null) {
+      console.error('[Workflow] Invalid approval signal: not an object');
+      return;
+    }
+
+    if (typeof decision.approved !== 'boolean') {
+      console.error('[Workflow] Invalid approval signal: missing or invalid "approved" field');
+      return;
+    }
+
+    if (decision.approved && decision.selectedVariation !== undefined) {
+      if (typeof decision.selectedVariation !== 'number' ||
+          decision.selectedVariation < 0 ||
+          decision.selectedVariation > 2) {
+        console.error('[Workflow] Invalid approval signal: invalid "selectedVariation" field');
+        return;
+      }
+    }
+
     approvalReceived = true;
     approvalDecision = decision;
+    console.log('[Workflow] Approval received:', {
+      approved: decision.approved,
+      variation: decision.selectedVariation
+    });
   });
 
   setHandler(cancelSignal, () => {
@@ -166,33 +203,84 @@ export async function facebookContentWorkflow(
       };
     }
 
-    if (!approvalDecision.approved) {
+    // Type assertion: at this point, approvalDecision is definitely not null
+    const decision: ApprovalDecision = approvalDecision;
+
+    if (!decision.approved) {
       console.log('[Workflow] Content rejected by user');
       return {
         success: false,
-        variation: approvalDecision.selectedVariation,
+        variation: decision.selectedVariation,
         error: 'Content rejected during approval',
       };
     }
 
-    console.log(`[Workflow] Content approved! Variation ${approvalDecision.selectedVariation}`);
+    console.log(`[Workflow] Content approved! Variation ${decision.selectedVariation}`);
     const approvalEndTime = Date.now();
 
     // =====================================
     // ÉTAPE 5: Publication avec timing intelligent
     // =====================================
-    const selectedVariation = contentResult.variations[approvalDecision.selectedVariation];
-    const finalText = approvalDecision.customEdits || selectedVariation.text;
+
+    // Validate that variations exist and are valid (defensive programming)
+    if (!contentResult.variations || !Array.isArray(contentResult.variations) || contentResult.variations.length === 0) {
+      throw new Error('No content variations available - content generation may have failed');
+    }
+
+    // Validate selectedVariation index
+    if (
+      typeof decision.selectedVariation !== 'number' ||
+      decision.selectedVariation < 0 ||
+      decision.selectedVariation >= contentResult.variations.length
+    ) {
+      throw new Error(
+        `Invalid variation index: ${decision.selectedVariation} (must be 0-${contentResult.variations.length - 1})`
+      );
+    }
+
+    const selectedVariation = contentResult.variations[decision.selectedVariation];
+
+    // Additional safety check - ensure variation has required properties
+    if (!selectedVariation || typeof selectedVariation.text !== 'string' || !selectedVariation.text) {
+      throw new Error(`Selected variation ${decision.selectedVariation} is invalid or missing text`);
+    }
+
+    // Validate that customEdits is reasonable if provided
+    if (decision.customEdits && decision.customEdits.length > 5000) {
+      throw new Error('Custom edits too long (max 5000 characters)');
+    }
+
+    const finalText = decision.customEdits || selectedVariation.text;
 
     // Calculer timing optimal (si pas override)
-    let publishTime = approvalDecision.publishTime || input.scheduledPublishTime;
+    let publishTime = decision.publishTime || input.scheduledPublishTime;
 
     if (!publishTime) {
       // Générer timing randomisé dans fenêtre optimale (13h-16h ±30min)
+      // IMPORTANT: Use America/Toronto timezone (EST/EDT)
       const now = new Date();
-      const randomOffset = Math.floor(Math.random() * 60) - 30; // ±30min
-      publishTime = new Date(now);
-      publishTime.setHours(14, randomOffset, 0, 0); // Base: 14h00
+
+      // Get tomorrow at 14:00 in America/Toronto timezone
+      // We use toLocaleString to convert to Toronto time, then create a new Date
+      const torontoTime = new Date(
+        now.toLocaleString('en-US', { timeZone: 'America/Toronto' })
+      );
+
+      // Set to next day at 14:00 Toronto time
+      const tomorrow = new Date(torontoTime);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(14, 0, 0, 0);
+
+      // Add random offset ±30min
+      const randomOffset = Math.floor(Math.random() * 60) - 30; // minutes
+      tomorrow.setMinutes(randomOffset);
+
+      // Convert back to UTC for internal storage
+      publishTime = new Date(
+        tomorrow.toLocaleString('en-US', { timeZone: 'UTC' })
+      );
+
+      console.log(`[Workflow] Scheduled publish time: ${publishTime.toISOString()} (${tomorrow.toLocaleString('en-US', { timeZone: 'America/Toronto' })} Toronto time)`);
     }
 
     // Attendre jusqu'au moment optimal
@@ -219,28 +307,37 @@ export async function facebookContentWorkflow(
     // =====================================
     // ÉTAPE 6: Collecte analytics (24h après)
     // =====================================
-    console.log('[Workflow] Scheduling analytics collection in 24h...');
-    await sleep('24 hours');
+    // Analytics collection is optional - don't fail the entire workflow if it fails
+    try {
+      console.log('[Workflow] Scheduling analytics collection in 24h...');
+      await sleep('24 hours');
 
-    const analyticsResult = await collectAnalytics({
-      postId: publishResult.postId,
-      publishedAt: publishTime,
-      variationIndex: approvalDecision.selectedVariation,
-      contentType: input.contentType,
-    });
-
-    // =====================================
-    // ÉTAPE 7: ML Optimization (optionnel)
-    // =====================================
-    if (analyticsResult.success && analyticsResult.metrics) {
-      console.log('[Workflow] Running ML optimization...');
-
-      await optimizePrompts({
+      const analyticsResult = await collectAnalytics({
+        postId: publishResult.postId,
+        publishedAt: publishTime,
+        variationIndex: decision.selectedVariation,
         contentType: input.contentType,
-        variationIndex: approvalDecision.selectedVariation,
-        metrics: analyticsResult.metrics,
-        originalPrompt: selectedVariation.promptUsed,
       });
+
+      // =====================================
+      // ÉTAPE 7: ML Optimization (optionnel)
+      // =====================================
+      if (analyticsResult.success && analyticsResult.metrics) {
+        console.log('[Workflow] Running ML optimization...');
+
+        await optimizePrompts({
+          contentType: input.contentType,
+          variationIndex: decision.selectedVariation,
+          metrics: analyticsResult.metrics,
+          originalPrompt: selectedVariation.promptUsed,
+        });
+      } else {
+        console.log('[Workflow] Skipping ML optimization - analytics collection failed or no metrics');
+      }
+    } catch (error) {
+      // Log error but don't fail the workflow - analytics is optional
+      console.error('[Workflow] Analytics collection failed:', error);
+      console.log('[Workflow] Continuing workflow despite analytics failure');
     }
 
     // =====================================
@@ -251,8 +348,11 @@ export async function facebookContentWorkflow(
     return {
       success: true,
       postId: publishResult.postId,
-      variation: approvalDecision.selectedVariation,
+      facebookPostId: publishResult.postId,
+      variation: decision.selectedVariation,
       publishedAt: publishTime,
+      imageUrl: imageResult.imageUrl,
+      variations: contentResult.variations,
       metrics: {
         generationTime: generationEndTime - startTime,
         approvalTime: approvalEndTime - generationEndTime,

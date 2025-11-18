@@ -10,6 +10,7 @@ import { Context } from '@temporalio/activity';
 import { CONTENT_PROMPTS } from '../../config/prompts.config.js';
 import { supabase } from '../../services/supabase.service.js';
 import { calculateEngagementScore } from '../../services/ml-optimizer.service.js';
+import { captureError, addBreadcrumb } from '../../config/sentry.js';
 
 const anthropic = new Anthropic({
   apiKey: process.env.KAI_API_KEY || process.env.ANTHROPIC_API_KEY,
@@ -36,6 +37,45 @@ export interface GenerateContentResult {
 }
 
 /**
+ * Validates input to prevent prompt injection and DoS attacks
+ */
+function validateContentInput(input: GenerateContentInput): void {
+  // Validate content type
+  const validTypes = ['case_study', 'statistic', 'tip', 'news', 'testimonial'];
+  if (!validTypes.includes(input.contentType)) {
+    throw new Error(`Invalid content type: ${input.contentType}`);
+  }
+
+  // Validate override prompt if provided
+  if (input.overridePrompt) {
+    // Check length to prevent DoS via API cost
+    if (input.overridePrompt.length > 2000) {
+      throw new Error('Override prompt too long (max 2000 characters)');
+    }
+
+    // Check for prompt injection patterns
+    const suspiciousPatterns = [
+      /ignore\s+previous\s+instructions/i,
+      /disregard\s+all\s+prior/i,
+      /system\s*:\s*role/i,
+      /forget\s+everything/i,
+      /<\s*script/i, // XSS attempt
+    ];
+
+    for (const pattern of suspiciousPatterns) {
+      if (pattern.test(input.overridePrompt)) {
+        throw new Error('Invalid prompt content detected - potential injection attempt');
+      }
+    }
+  }
+
+  // Validate template ID format if provided
+  if (input.templateId && !/^[a-zA-Z0-9_-]{1,50}$/.test(input.templateId)) {
+    throw new Error('Invalid template ID format');
+  }
+}
+
+/**
  * Génère 3 variations de contenu Facebook optimisées
  */
 export async function generateContentVariations(
@@ -45,6 +85,9 @@ export async function generateContentVariations(
 
   try {
     console.log(`[Activity:GenerateContent] Starting for type: ${input.contentType}`);
+
+    // Validate input to prevent attacks
+    validateContentInput(input);
 
     // Récupérer le prompt optimal (template ou custom)
     const basePrompt = input.overridePrompt ||
@@ -59,42 +102,90 @@ export async function generateContentVariations(
       'question',
     ];
 
+    const MAX_RETRIES = 2;
+
     for (const style of styles) {
-      context.heartbeat(`Generating ${style} variation`);
+      let attempt = 0;
+      let generatedText = '';
+      let fullPrompt = '';
+      let validation: { valid: boolean; reason?: string } = { valid: false, reason: '' };
 
-      const fullPrompt = buildPrompt(basePrompt, style, input.contentType);
+      // Retry logic with exponential backoff
+      while (attempt <= MAX_RETRIES) {
+        try {
+          context.heartbeat(`Generating ${style} variation (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
 
-      const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514', // Claude Sonnet 4.5 (latest)
-        max_tokens: 500,
-        temperature: 0.7, // Créativité contrôlée
-        system: SYSTEM_PROMPT_FACEBOOK,
-        messages: [
-          {
-            role: 'user',
-            content: fullPrompt,
-          },
-        ],
-      });
+          fullPrompt = buildPrompt(basePrompt, style, input.contentType);
 
-      const generatedText = response.content[0].type === 'text'
-        ? response.content[0].text
-        : '';
+          const response = await anthropic.messages.create({
+            model: 'claude-sonnet-4-20250514', // Claude Sonnet 4.5 (latest)
+            max_tokens: 500,
+            temperature: 0.7 + (attempt * 0.1), // Increase temperature slightly on retries
+            system: SYSTEM_PROMPT_FACEBOOK,
+            messages: [
+              {
+                role: 'user',
+                content: fullPrompt,
+              },
+            ],
+          });
 
-      if (!generatedText) {
-        throw new Error(`Claude returned empty response for ${style} variation`);
+          // Heartbeat after API call to prevent timeout
+          context.heartbeat(`Validating ${style} content`);
+
+          // Validate response structure (prevent null/undefined access)
+          if (!response.content || !Array.isArray(response.content) || response.content.length === 0) {
+            throw new Error(`Claude returned invalid response structure for ${style} variation`);
+          }
+
+          const firstContent = response.content[0];
+          if (!firstContent || typeof firstContent !== 'object') {
+            throw new Error(`Claude returned invalid content object for ${style} variation`);
+          }
+
+          generatedText = firstContent.type === 'text' && 'text' in firstContent
+            ? firstContent.text
+            : '';
+
+          if (!generatedText) {
+            throw new Error(`Claude returned empty response for ${style} variation`);
+          }
+
+          // Validation anti-clichés IA
+          validation = validateContent(generatedText);
+          if (validation.valid) {
+            break; // Success! Exit retry loop
+          }
+
+          console.warn(`[Activity:GenerateContent] Validation failed for ${style} (attempt ${attempt + 1}): ${validation.reason}`);
+          attempt++;
+
+          // Don't retry if we've exhausted attempts
+          if (attempt > MAX_RETRIES) {
+            break;
+          }
+
+        } catch (error) {
+          console.error(`[Activity:GenerateContent] Error generating ${style} (attempt ${attempt + 1}):`, error);
+          attempt++;
+
+          if (attempt > MAX_RETRIES) {
+            throw error; // Re-throw on final attempt
+          }
+        }
       }
 
-      // Validation anti-clichés IA
-      const validation = validateContent(generatedText);
+      // Skip this style if validation failed after all retries
       if (!validation.valid) {
-        console.warn(`[Activity:GenerateContent] Validation failed for ${style}: ${validation.reason}`);
-        // Retry avec prompt ajusté
+        console.error(`[Activity:GenerateContent] Failed to generate valid ${style} variation after ${MAX_RETRIES + 1} attempts`);
         continue;
       }
 
       // Extraire hashtags
       const hashtags = extractHashtags(generatedText, input.contentType);
+
+      // Heartbeat before async scoring operation
+      context.heartbeat(`Calculating engagement score for ${style}`);
 
       // Calculer score engagement prédit (ML)
       const score = await calculateEngagementScore({
@@ -120,17 +211,25 @@ export async function generateContentVariations(
       throw new Error(`Only generated ${variations.length} valid variations (minimum 2 required)`);
     }
 
-    // Stocker dans Supabase pour historique
-    await supabase.from('content_generations').insert({
-      content_type: input.contentType,
-      variations: variations.map(v => ({
-        text: v.text,
-        style: v.style,
-        score: v.score,
-      })),
-      template_id: input.templateId,
-      status: 'pending_approval',
-    });
+    // Heartbeat before database operation
+    context.heartbeat('Saving to database');
+
+    // Stocker dans Supabase pour historique (CRITICAL: check for errors)
+    try {
+      await supabase.createContentGeneration({
+        content_type: input.contentType,
+        variations: variations.map(v => ({
+          text: v.text,
+          style: v.style,
+          score: v.score,
+          hashtags: v.hashtags,
+        })),
+        template_id: input.templateId,
+      });
+    } catch (dbError) {
+      console.error('[Activity:GenerateContent] Database insert failed:', dbError);
+      throw new Error(`Failed to save content to database: ${dbError instanceof Error ? dbError.message : 'unknown error'}`);
+    }
 
     return {
       success: true,
@@ -139,6 +238,16 @@ export async function generateContentVariations(
 
   } catch (error) {
     console.error('[Activity:GenerateContent] Error:', error);
+
+    // Send to Sentry with context
+    if (error instanceof Error) {
+      captureError(error, {
+        activity: 'generateContentVariations',
+        contentType: input.contentType,
+        templateId: input.templateId,
+        hasOverridePrompt: !!input.overridePrompt,
+      });
+    }
 
     return {
       success: false,
@@ -160,7 +269,7 @@ async function getOptimizedPrompt(
 ): Promise<string> {
   // Si templateId spécifié, utiliser ce template
   if (templateId) {
-    const { data } = await supabase
+    const { data } = await supabase.getClient()
       .from('content_templates')
       .select('template_text')
       .eq('id', templateId)
@@ -170,7 +279,7 @@ async function getOptimizedPrompt(
   }
 
   // Sinon, récupérer le prompt optimisé par ML (meilleur performant)
-  const { data: optimized } = await supabase
+  const { data: optimized } = await supabase.getClient()
     .from('ai_prompts')
     .select('prompt_text')
     .eq('prompt_type', `claude_${contentType}`)

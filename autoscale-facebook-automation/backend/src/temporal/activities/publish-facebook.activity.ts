@@ -10,10 +10,12 @@ import CircuitBreaker from 'opossum';
 import pRetry from 'p-retry';
 import axios from 'axios';
 import { supabase } from '../../services/supabase.service.js';
+import { getRequiredEnv } from '../../config/env.js';
+import { captureError, addBreadcrumb } from '../../config/sentry.js';
 
 const FACEBOOK_GRAPH_API = 'https://graph.facebook.com/v18.0';
-const PAGE_ID = process.env.FACEBOOK_PAGE_ID!;
-const ACCESS_TOKEN = process.env.FACEBOOK_ACCESS_TOKEN!;
+const PAGE_ID = getRequiredEnv('FACEBOOK_PAGE_ID');
+const ACCESS_TOKEN = getRequiredEnv('FACEBOOK_ACCESS_TOKEN');
 
 export interface PublishToFacebookInput {
   text: string;
@@ -40,6 +42,31 @@ const circuitBreakerOptions = {
   rollingCountBuckets: 10,
   name: 'FacebookPublishingCircuitBreaker',
 };
+
+// Create circuit breaker ONCE at module scope (NOT per request)
+// This prevents memory leaks from creating new breakers + event listeners
+let facebookCircuitBreaker: CircuitBreaker | null = null;
+
+function getFacebookCircuitBreaker(): CircuitBreaker {
+  if (!facebookCircuitBreaker) {
+    facebookCircuitBreaker = new CircuitBreaker(publishPostDirect, circuitBreakerOptions);
+
+    // Event listeners registered ONCE
+    facebookCircuitBreaker.on('open', () => {
+      console.error('[CircuitBreaker] OPEN - Facebook API temporairement désactivé');
+    });
+
+    facebookCircuitBreaker.on('halfOpen', () => {
+      console.log('[CircuitBreaker] HALF_OPEN - Test de reconnexion Facebook');
+    });
+
+    facebookCircuitBreaker.on('close', () => {
+      console.log('[CircuitBreaker] CLOSED - Facebook API opérationnel');
+    });
+  }
+
+  return facebookCircuitBreaker;
+}
 
 /**
  * Publie post Facebook avec resilience maximale
@@ -77,14 +104,25 @@ export async function publishToFacebook(
 
     console.log(`[Activity:PublishFacebook] Published successfully: ${postId}`);
 
-    // Step 3: Enregistrer dans Supabase
-    await supabase.from('facebook_posts').insert({
+    // Step 3: Enregistrer dans Supabase (CRITICAL: check for errors to prevent data loss)
+    context.heartbeat('Saving to database');
+
+    const { data, error: dbError } = await supabase.getClient().from('facebook_posts').insert({
       post_id: postId,
       content: input.text,
       image_url: input.imageUrl,
       published_at: input.scheduledTime || new Date(),
       status: 'published',
     });
+
+    // CRITICAL: If database insert fails, we MUST fail the activity
+    // This ensures Temporal retries and we don't lose tracking data
+    if (dbError) {
+      console.error('[Activity:PublishFacebook] Database insert failed:', dbError);
+      throw new Error(`Failed to save post to database: ${dbError.message}. Post was published to Facebook (${postId}) but tracking data was lost.`);
+    }
+
+    console.log('[Activity:PublishFacebook] Successfully saved to database');
 
     return {
       success: true,
@@ -95,8 +133,18 @@ export async function publishToFacebook(
   } catch (error) {
     console.error('[Activity:PublishFacebook] Error:', error);
 
+    // Send to Sentry with context
+    if (error instanceof Error) {
+      captureError(error, {
+        activity: 'publishToFacebook',
+        hasImage: !!input.imageUrl,
+        hasScheduledTime: !!input.scheduledTime,
+        textLength: input.text.length,
+      });
+    }
+
     // Enregistrer échec dans Supabase pour debugging
-    await supabase.from('facebook_posts').insert({
+    await supabase.getClient().from('facebook_posts').insert({
       content: input.text,
       image_url: input.imageUrl,
       status: 'failed',
@@ -160,24 +208,11 @@ async function publishPostWithCircuitBreaker(params: {
   photoId?: string;
   scheduledTime?: Date;
 }): Promise<string> {
-  // Créer circuit breaker
-  const breaker = new CircuitBreaker(publishPostDirect, circuitBreakerOptions);
+  // Use singleton circuit breaker (prevents memory leak)
+  const breaker = getFacebookCircuitBreaker();
 
-  // Event listeners pour debugging
-  breaker.on('open', () => {
-    console.error('[CircuitBreaker] OPEN - Facebook API temporairement désactivé');
-  });
-
-  breaker.on('halfOpen', () => {
-    console.log('[CircuitBreaker] HALF_OPEN - Test de reconnexion Facebook');
-  });
-
-  breaker.on('close', () => {
-    console.log('[CircuitBreaker] CLOSED - Facebook API opérationnel');
-  });
-
-  // Exécuter avec circuit breaker
-  return breaker.fire(params);
+  // Exécuter avec circuit breaker (type-cast since opossum returns unknown)
+  return breaker.fire(params) as Promise<string>;
 }
 
 /**

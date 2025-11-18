@@ -3,44 +3,124 @@
  * Express server avec endpoints pour workflows Temporal
  */
 
+// CRITICAL: Load environment variables FIRST before any other imports
+import { config } from 'dotenv';
+config();
+
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import { config } from 'dotenv';
+import rateLimit from 'express-rate-limit';
 import { Connection, WorkflowClient } from '@temporalio/client';
 import { facebookContentWorkflow } from './temporal/workflows/facebook-content.workflow.js';
 import supabase from './services/supabase.service.js';
+import { validateEnv, getOptionalEnv, getEnvAsInt } from './config/env.js';
+import {
+  validateWorkflowId,
+  validateContentType,
+  validateVariationIndex,
+  validatePublishTime,
+  validateLimit,
+  validateOffset,
+  sanitizeText,
+} from './utils/validation.js';
+import {
+  initializeSentry,
+  captureError,
+  captureMessage,
+  addBreadcrumb,
+  isSentryEnabled,
+  Sentry,
+} from './config/sentry.js';
 
-// Load environment variables
-config();
+// Validate environment variables before starting server
+try {
+  validateEnv();
+} catch (error) {
+  console.error('[SERVER] Failed to start due to environment validation errors');
+  process.exit(1);
+}
+
+// Initialize Sentry monitoring
+initializeSentry();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-const NODE_ENV = process.env.NODE_ENV || 'development';
-const TEMPORAL_ADDRESS = process.env.TEMPORAL_ADDRESS || 'localhost:7233';
+const PORT = getEnvAsInt('PORT', 3001);
+const NODE_ENV = getOptionalEnv('NODE_ENV', 'development');
+const TEMPORAL_ADDRESS = getOptionalEnv('TEMPORAL_ADDRESS', 'localhost:7233');
 const TASK_QUEUE = 'facebook-automation';
 
 // ==========================================
 // MIDDLEWARES
 // ==========================================
 
+// Sentry instrumentation (MUST be first) - v10+ uses setupExpressErrorHandler at the end
+// No request handler needed in v10+
+
 // Security headers
 app.use(helmet());
 
-// CORS
+// CORS - Secure configuration
+const allowedOrigins = getOptionalEnv('ALLOWED_ORIGINS', 'http://localhost:3000,http://localhost:3001')
+  .split(',')
+  .map(origin => origin.trim());
+
+if (NODE_ENV === 'production') {
+  allowedOrigins.push('https://autoscaleai.ca', 'https://dashboard.autoscaleai.ca');
+}
+
 app.use(
   cors({
-    origin:
-      NODE_ENV === 'production'
-        ? ['https://autoscaleai.ca', 'https://dashboard.autoscaleai.ca']
-        : '*',
+    origin: (origin, callback) => {
+      // Allow requests with no origin (mobile apps, Postman, etc.)
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        console.warn(`[CORS] Blocked request from unauthorized origin: ${origin}`);
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     credentials: true,
+    maxAge: 86400, // Cache preflight requests for 24 hours
   })
 );
 
 // Body parser
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Rate Limiting - Global limit for all API endpoints
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: {
+    error: 'Too many requests from this IP',
+    message: 'Please try again later',
+  },
+  standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
+  legacyHeaders: false, // Disable `X-RateLimit-*` headers
+  // Skip rate limiting for health check
+  skip: (req: Request) => req.path === '/health',
+});
+
+// Stricter rate limiting for expensive operations
+const workflowLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5, // 5 workflow triggers per minute per IP
+  message: {
+    error: 'Too many workflow requests',
+    message: 'Please wait before triggering more workflows',
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Apply global rate limiter to all /api routes
+app.use('/api/', apiLimiter);
 
 // Request logging
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -49,21 +129,41 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 // ==========================================
-// TEMPORAL CLIENT SINGLETON
+// TEMPORAL CLIENT SINGLETON (Thread-Safe)
 // ==========================================
 
 let temporalClient: WorkflowClient | null = null;
+let temporalClientPromise: Promise<WorkflowClient> | null = null;
 
 async function getTemporalClient(): Promise<WorkflowClient> {
-  if (!temporalClient) {
-    console.log('[API] Connexion à Temporal Server...');
-    const connection = await Connection.connect({
-      address: TEMPORAL_ADDRESS,
-    });
-    temporalClient = new WorkflowClient({ connection });
-    console.log('[API] ✅ Temporal Client connecté');
+  // If already initialized, return immediately
+  if (temporalClient) {
+    return temporalClient;
   }
-  return temporalClient;
+
+  // If initialization in progress, wait for it
+  if (temporalClientPromise) {
+    return temporalClientPromise;
+  }
+
+  // Start initialization (race condition protected)
+  temporalClientPromise = (async () => {
+    try {
+      console.log('[API] Connexion à Temporal Server...');
+      const connection = await Connection.connect({
+        address: TEMPORAL_ADDRESS,
+      });
+      temporalClient = new WorkflowClient({ connection });
+      console.log('[API] ✅ Temporal Client connecté');
+      return temporalClient;
+    } catch (error) {
+      // Reset promise on error so next call can retry
+      temporalClientPromise = null;
+      throw error;
+    }
+  })();
+
+  return temporalClientPromise;
 }
 
 // ==========================================
@@ -121,24 +221,29 @@ app.get('/', (req: Request, res: Response) => {
  */
 app.post(
   '/api/trigger-workflow',
+  workflowLimiter, // Apply stricter rate limit for workflow triggers
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { contentType, templateId }: TriggerWorkflowBody = req.body;
 
-      // Validation
-      const validTypes = [
-        'case_study',
-        'statistic',
-        'tip',
-        'news',
-        'testimonial',
-      ];
+      // Validate content type
       const type = contentType || 'statistic';
-
-      if (!validTypes.includes(type)) {
+      if (!validateContentType(type)) {
         return res.status(400).json({
           error: 'Invalid content type',
-          validTypes,
+          validTypes: ['case_study', 'statistic', 'tip', 'news', 'testimonial'],
+        });
+      }
+
+      // Validate template ID if provided
+      if (templateId && typeof templateId !== 'string') {
+        return res.status(400).json({
+          error: 'Invalid template ID',
+        });
+      }
+      if (templateId && !/^[a-zA-Z0-9_-]{1,50}$/.test(templateId)) {
+        return res.status(400).json({
+          error: 'Invalid template ID format (alphanumeric, underscore, dash only, max 50 chars)',
         });
       }
 
@@ -189,17 +294,61 @@ app.post(
       const { approved, selectedVariation, customEdits, publishTime }: ApprovalBody =
         req.body;
 
-      // Validation
+      // Validate workflow ID format (SQL injection protection)
+      if (!validateWorkflowId(workflowId)) {
+        return res.status(400).json({
+          error: 'Invalid workflow ID format',
+        });
+      }
+
+      // Validate approved field
       if (typeof approved !== 'boolean') {
         return res.status(400).json({
           error: 'Field "approved" (boolean) is required',
         });
       }
 
-      if (approved && selectedVariation === undefined) {
-        return res.status(400).json({
-          error: 'Field "selectedVariation" is required when approved=true',
-        });
+      // Validate selectedVariation when approved
+      if (approved) {
+        if (selectedVariation === undefined) {
+          return res.status(400).json({
+            error: 'Field "selectedVariation" is required when approved=true',
+          });
+        }
+
+        if (!validateVariationIndex(selectedVariation)) {
+          return res.status(400).json({
+            error: 'Invalid selectedVariation (must be 0, 1, or 2)',
+          });
+        }
+      }
+
+      // Validate and sanitize customEdits
+      let sanitizedEdits: string | undefined;
+      if (customEdits) {
+        if (typeof customEdits !== 'string') {
+          return res.status(400).json({
+            error: 'Field "customEdits" must be a string',
+          });
+        }
+        if (customEdits.length > 5000) {
+          return res.status(400).json({
+            error: 'Field "customEdits" too long (max 5000 characters)',
+          });
+        }
+        sanitizedEdits = sanitizeText(customEdits);
+      }
+
+      // Validate publishTime
+      let validatedPublishTime: Date | undefined;
+      if (publishTime) {
+        try {
+          validatedPublishTime = validatePublishTime(publishTime);
+        } catch (error) {
+          return res.status(400).json({
+            error: error instanceof Error ? error.message : 'Invalid publishTime',
+          });
+        }
       }
 
       console.log('[API] Approbation workflow:', workflowId, {
@@ -213,12 +362,12 @@ app.post(
       // Récupérer handle workflow
       const handle = client.getHandle(workflowId);
 
-      // Envoyer signal d'approbation
+      // Envoyer signal d'approbation (using validated/sanitized values)
       await handle.signal('approval', {
         approved,
         selectedVariation,
-        customEdits,
-        publishTime: publishTime ? new Date(publishTime) : undefined,
+        customEdits: sanitizedEdits,
+        publishTime: validatedPublishTime,
       });
 
       console.log('[API] ✅ Signal envoyé:', workflowId);
@@ -252,6 +401,13 @@ app.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { workflowId } = req.params;
+
+      // Validate workflow ID format (SQL injection protection)
+      if (!validateWorkflowId(workflowId)) {
+        return res.status(400).json({
+          error: 'Invalid workflow ID format',
+        });
+      }
 
       console.log('[API] Status workflow:', workflowId);
 
@@ -289,14 +445,19 @@ app.get(
   '/api/pending-approvals',
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      console.log('[API] Récupération pending approvals');
+      // Validate and sanitize pagination parameters
+      const limit = validateLimit(req.query.limit as string | undefined);
+      const offset = validateOffset(req.query.offset as string | undefined);
 
-      const { data, error } = await supabase
+      console.log('[API] Récupération pending approvals', { limit, offset });
+
+      const { data, error, count } = await supabase
         .getClient()
         .from('approval_queue')
-        .select('*')
+        .select('*', { count: 'exact' })
         .eq('status', 'pending')
-        .order('created_at', { ascending: false });
+        .order('created_at', { ascending: false })
+        .range(offset, offset + limit - 1);
 
       if (error) {
         throw new Error(`Erreur Supabase: ${error.message}`);
@@ -305,6 +466,9 @@ app.get(
       res.json({
         success: true,
         count: data.length,
+        total: count || 0,
+        limit,
+        offset,
         approvals: data,
       });
     } catch (error) {
@@ -321,7 +485,8 @@ app.get(
   '/api/recent-posts',
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const limit = parseInt(req.query.limit as string) || 10;
+      // Use validation utility (consistent with other endpoints, prevents DoS)
+      const limit = validateLimit(req.query.limit as string | undefined);
 
       console.log('[API] Récupération recent posts:', limit);
 
@@ -362,15 +527,38 @@ app.use((req: Request, res: Response) => {
 });
 
 /**
- * Global error handler
+ * Global error handler (Sentry v10+ auto-instruments Express errors)
+ * NEVER exposes stack traces to prevent information leakage
  */
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
-  console.error('[API] ❌ Error:', err);
+  // Log full error details server-side
+  console.error('[API] ❌ Error:', {
+    message: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+    timestamp: new Date().toISOString(),
+  });
 
+  // Send to Sentry with additional context
+  if (isSentryEnabled()) {
+    captureError(err, {
+      path: req.path,
+      method: req.method,
+      query: req.query,
+      body: req.body,
+      ip: req.ip,
+    });
+  }
+
+  // NEVER expose stack traces or detailed error messages to client
   res.status(500).json({
     error: 'Internal Server Error',
-    message: NODE_ENV === 'development' ? err.message : undefined,
-    stack: NODE_ENV === 'development' ? err.stack : undefined,
+    message: 'An unexpected error occurred. Please try again later.',
+    // In development, hint where to find details
+    ...(NODE_ENV === 'development' && {
+      hint: 'Check server logs or Sentry for detailed error information',
+    }),
   });
 });
 

@@ -4,6 +4,10 @@
  * Utilise SERVICE_KEY pour bypass RLS (backend trusted)
  */
 
+// CRITICAL: Load .env before creating Supabase client
+import { config } from 'dotenv';
+config();
+
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 // Types pour les tables Supabase
